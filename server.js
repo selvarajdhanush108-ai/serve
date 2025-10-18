@@ -5,6 +5,7 @@ const http = require("http");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
 const { Server } = require("socket.io");
 
 const app = express();
@@ -12,10 +13,7 @@ const server = http.createServer(app);
 
 // ---- SOCKET.IO ----
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-  },
+  cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
 app.use(cors());
@@ -24,6 +22,7 @@ app.use(express.json());
 // ---- ENVIRONMENT ----
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
+const JWT_SECRET = process.env.JWT_SECRET || "replace_this_in_prod";
 
 // ---- MONGOOSE MODELS ----
 const userSchema = new mongoose.Schema({
@@ -58,23 +57,26 @@ async function connectDb() {
     console.error("MONGO_URI not set. Set it in .env");
     process.exit(1);
   }
-  await mongoose.connect(MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-  });
+  await mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true });
   console.log("✅ MongoDB connected");
 }
-connectDb().catch((err) => {
-  console.error("Mongo connection error:", err);
-  process.exit(1);
-});
+connectDb().catch(err => { console.error("Mongo connection error:", err); process.exit(1); });
+
+// ---- JWT HELPERS ----
+function createToken(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
+}
+
+async function verifyToken(token) {
+  return jwt.verify(token, JWT_SECRET);
+}
 
 // ---- ROUTES ----
 
 // Health check
 app.get("/health", (req, res) => res.send("Bus Tracker Server running"));
 
-// Register bus driver (no JWT)
+// Register (JWT only for auth, optional)
 app.post("/register", async (req, res) => {
   try {
     const { busId, password } = req.body;
@@ -89,14 +91,15 @@ app.post("/register", async (req, res) => {
     const user = new User({ busId, passwordHash });
     await user.save();
 
-    return res.json({ success: true, busId });
+    const token = createToken({ busId, id: user._id });
+    return res.json({ success: true, busId, token });
   } catch (err) {
     console.error("register err:", err);
     return res.status(500).json({ error: "server error" });
   }
 });
 
-// Login bus driver (no JWT)
+// Login
 app.post("/login", async (req, res) => {
   try {
     const { busId, password } = req.body;
@@ -108,14 +111,15 @@ app.post("/login", async (req, res) => {
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
-    return res.json({ success: true, busId });
+    const token = createToken({ busId, id: user._id });
+    return res.json({ success: true, busId, token });
   } catch (err) {
     console.error("login err:", err);
     return res.status(500).json({ error: "server error" });
   }
 });
 
-// Latest bus locations
+// Get latest bus locations (public)
 app.get("/latest", async (req, res) => {
   try {
     const rows = await LastLocation.find({});
@@ -129,13 +133,12 @@ app.get("/latest", async (req, res) => {
 io.on("connection", (socket) => {
   console.log(`🔌 New client connected: ${socket.id}`);
 
-  // Receive location updates from buses
+  // Receive location updates (no JWT required)
   socket.on("updateLocation", async (data) => {
     try {
       const { busId, latitude, longitude, speed, timestamp } = data;
       if (!busId || latitude == null || longitude == null) return;
 
-      // Save history
       const locDoc = new Location({
         busId,
         latitude,
@@ -145,22 +148,13 @@ io.on("connection", (socket) => {
       });
       await locDoc.save();
 
-      // Upsert last known location
       await LastLocation.findOneAndUpdate(
         { busId },
-        {
-          busId,
-          latitude,
-          longitude,
-          speed: speed ?? 0,
-          timestamp: timestamp ? new Date(timestamp) : new Date(),
-        },
+        { busId, latitude, longitude, speed: speed ?? 0, timestamp: locDoc.timestamp },
         { upsert: true, new: true }
       );
 
-      // Broadcast to all clients
       io.emit("busLocationUpdate", { busId, latitude, longitude, speed, timestamp: locDoc.timestamp });
-
       console.log(`📍 Saved/Emitted Bus ${busId}`, { latitude, longitude, speed });
     } catch (err) {
       console.error("updateLocation err:", err);
