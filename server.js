@@ -57,7 +57,7 @@ async function connectDb() {
     console.error("MONGO_URI not set. Set it in .env");
     process.exit(1);
   }
-  await mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true });
+  await mongoose.connect(MONGO_URI);
   console.log("✅ MongoDB connected");
 }
 connectDb().catch(err => { console.error("Mongo connection error:", err); process.exit(1); });
@@ -129,11 +129,24 @@ app.get("/latest", async (req, res) => {
   }
 });
 
+// NEW: Get a list of currently active bus IDs for the dropdown
+app.get("/activeBuses", async (req, res) => {
+  try {
+    const buses = await LastLocation.find({}).select("busId -_id");
+    const busIds = buses.map(b => b.busId);
+    res.json(busIds);
+  } catch (err) {
+    console.error("activeBuses err:", err);
+    res.status(500).json({ error: "server error" });
+  }
+});
+
+
 // ---- SOCKET.IO ----
 io.on("connection", (socket) => {
   console.log(`🔌 New client connected: ${socket.id}`);
 
-  // Receive location updates (no JWT required)
+  // This endpoint is used by the bus driver's device to send location data.
   socket.on("updateLocation", async (data) => {
     try {
       const { busId, latitude, longitude, speed, timestamp } = data;
@@ -154,7 +167,8 @@ io.on("connection", (socket) => {
         { upsert: true, new: true }
       );
 
-      io.emit("busLocationUpdate", { busId, latitude, longitude, speed, timestamp: locDoc.timestamp });
+      // This emits the update to all connected web clients.
+      io.emit("busLocationUpdate", { busId, latitude, longitude, speed, timestamp: locDoc.timestamp.toISOString() });
       console.log(`📍 Saved/Emitted Bus ${busId}`, { latitude, longitude, speed });
     } catch (err) {
       console.error("updateLocation err:", err);
